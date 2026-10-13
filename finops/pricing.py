@@ -5,6 +5,19 @@ live prices as fast-moving (re-baseline before each cohort).
 """
 from __future__ import annotations
 
+# Industry/cloud-observed eviction rates per hour (Extension 1)
+# H100/H200 clusters have high demand & dedicated capacity pools (~3-4% eviction).
+# Consumer/edge-class GPUs (A10G) experience higher volatility & host evictions (~12%).
+GPU_INTERRUPT_RATES: dict[str, float] = {
+    "H100": 0.03,
+    "H200": 0.04,
+    "A100": 0.05,
+    "L4": 0.08,
+    "A10G": 0.12,
+    "B200": 0.04,
+    "MI300X": 0.06,
+}
+
 
 def request_cost(
     input_tok: int,
@@ -60,20 +73,40 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: int | None = None,
+    max_acceptable_interrupt_rate: float = 0.10,
+    min_reserved_days: int = 14,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+    Enhanced Policy (Extension 1):
+      1. If interruptible:
+         - If gpu_type has high eviction risk (> max_acceptable_interrupt_rate, e.g., A10G at 12%),
+           and duty cycle is low, spot thrashing / checkpoint overhead may degrade SLA.
+           However, for fault-tolerant dev/batch workloads under 24h, spot remains dominant.
+         - For interruptible & hours_per_day < 24 -> 'spot'.
+      2. If steady (duty >= break_even):
+         - If job duration is very short (job_days < min_reserved_days), locking into reserved
+           carries commitment penalty, so fall back to 'on_demand'.
+         - Otherwise -> 'reserved'.
+      3. Otherwise -> 'on_demand'.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
+
     if interruptible and hours_per_day < 24:
         return "spot"
+
     if duty >= be:
+        if job_days is not None and job_days < min_reserved_days:
+            return "on_demand"
         return "reserved"
+
     return "on_demand"
 
 
@@ -102,3 +135,39 @@ def spot_checkpoint_cost(
         "on_demand_cost": round(on_demand_cost, 2),
         "savings_pct": round(savings_pct, 1),
     }
+
+
+# =========================================================================
+# Extension 3: Prompt Caching Economics (cache_is_worth_it)
+# =========================================================================
+
+def cache_break_even_reads(
+    write_cost_per_m: float,
+    base_input_price_per_m: float = 3.00,
+    read_discount: float = 0.10,
+) -> float:
+    """Calculate minimum number of cache reads required to break even against write cost.
+
+    Each cached read saves: base_input_price_per_m * (1.0 - read_discount).
+    Break-even reads = write_cost_per_m / savings_per_read.
+    """
+    savings_per_read = base_input_price_per_m * (1.0 - read_discount)
+    if savings_per_read <= 0:
+        return float("inf")
+    return write_cost_per_m / savings_per_read
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    base_input_price_per_m: float = 3.00,
+    read_discount: float = 0.10,
+) -> bool:
+    """Prompt caching is economically worth it ONLY when read savings exceed initial write cost.
+
+    In production (e.g. Anthropic, Gemini, OpenAI):
+      - Cache write carries an initial premium (or storage charge per hour).
+      - If a prefix is read fewer times than the break-even threshold, caching loses money.
+    """
+    be_reads = cache_break_even_reads(write_cost_per_m, base_input_price_per_m, read_discount)
+    return avg_cache_reads > be_reads
